@@ -13,6 +13,10 @@ export type Player = {
   difficulty?: Difficulty
   bestPossibleMoves?: number
   left?: boolean
+  moveLog?: string
+  hintsUsed?: number
+  points?: number
+  raceNumber?: number
 }
 export type BestRecord = { bestTimeMs: number; bestMoves: number }
 export type BestStats = Record<string, BestRecord>

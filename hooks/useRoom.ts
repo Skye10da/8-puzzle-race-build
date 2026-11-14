@@ -5,7 +5,9 @@ import { getSupabaseClient } from '@/lib/supabase/client'
 import type { Player, GameMode, RoundState } from '@/lib/game-types'
 import { createPuzzle, getOptimalMoves, SOLVED_BOARD, type Difficulty } from '@/lib/puzzle-engine.mjs'
 import { prefetchPuzzleEngine } from '@/lib/prefetch-puzzle.mjs'
-import { estimateClockOffset, isDifficulty, isRoomCode, isValidBoard, parsePause, parsePlayer, parseRoundStart } from '@/lib/game-protocol.mjs'
+import { isStartAtInRange } from '@/lib/start-time.mjs'
+import { canSendReaction, isReactionEmoji, parseReaction, type ReactionEmoji } from '@/lib/reactions.mjs'
+import { estimateClockOffset, isDifficulty, isRoomCode, isSeriesLength, isValidBoard, parsePause, parsePlayer, parseRoundStart } from '@/lib/game-protocol.mjs'
 
 type RoomSnapshot = {
   room: string
@@ -19,6 +21,11 @@ type RoomSnapshot = {
   startedAt: number
   elapsed: number
   moves: number
+  moveLog: string
+  hintsEnabled: boolean
+  hintsUsed: number
+  seriesLength: 1 | 3 | 5
+  seriesScored: boolean
   paused: boolean
   difficulty: Difficulty
   dailyMode: boolean
@@ -40,6 +47,15 @@ type Options = {
   paused: boolean
   me: Player | null
   movesRef: MutableRefObject<number>
+  moveLogRef: MutableRefObject<string>
+  hintsEnabled: boolean
+  hintsUsedRef: MutableRefObject<number>
+  setHintsEnabled: Dispatch<SetStateAction<boolean>>
+  setHintsUsed: Dispatch<SetStateAction<number>>
+  seriesLength: 1 | 3 | 5
+  setSeriesLength: Dispatch<SetStateAction<1 | 3 | 5>>
+  seriesScoredRef: MutableRefObject<boolean>
+  onReaction: (gid: string, emoji: ReactionEmoji) => void
   optimalMovesRef: MutableRefObject<number>
   initialBoardRef: MutableRefObject<string>
   roundSeedRef: MutableRefObject<number | null>
@@ -55,6 +71,7 @@ type Options = {
   setElapsed: Dispatch<SetStateAction<number>>
   setPaused: Dispatch<SetStateAction<boolean>>
   setMessage: Dispatch<SetStateAction<string>>
+  setClockSyncWarning: Dispatch<SetStateAction<boolean>>
   beginRound: (seed: number, difficulty: Difficulty, startAt: number) => void
   unlockAudio: () => void
   startMusic: () => void
@@ -74,10 +91,14 @@ export function useRoom(options: Options) {
   const clockOffsetRef = useRef<number | null>(null)
   const clockPongWaitersRef = useRef(new Map<string, (hostAt: number) => void>())
   const clockHostRef = useRef('')
+  const reactionReceivedAtRef = useRef(new Map<string, number>())
+  const lastReactionSentAtRef = useRef<number | null>(null)
+  const clockSyncRetryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const host = hostGid === gidRef.current
 
-  const synchronizeClock = async (channel: any, participantGid: string, currentHostGid: string) => {
-    if (participantGid === currentHostGid) { clockOffsetRef.current = 0; return }
+  const synchronizeClock: (channel: any, participantGid: string, currentHostGid: string, retrying?: boolean) => Promise<void> = async (channel, participantGid, currentHostGid, retrying = false) => {
+    if (!retrying && clockSyncRetryRef.current) { clearTimeout(clockSyncRetryRef.current); clockSyncRetryRef.current = null }
+    if (participantGid === currentHostGid) { clockOffsetRef.current = 0; options.setClockSyncWarning(false); return }
     const samples: Array<{ rttMs: number; offsetMs: number }> = []
     for (let index = 0; index < 3; index++) {
       const pingId = crypto.randomUUID()
@@ -91,13 +112,71 @@ export function useRoom(options: Options) {
       if (pong) samples.push({ rttMs: pong.receivedAt - sentAt, offsetMs: pong.hostAt - (sentAt + pong.receivedAt) / 2 })
       if (index < 2) await new Promise(resolve => setTimeout(resolve, 80))
     }
-    clockOffsetRef.current = estimateClockOffset(samples)
+    const offset = estimateClockOffset(samples)
+    if (offset !== null) {
+      clockOffsetRef.current = offset
+      options.setClockSyncWarning(false)
+      if (clockSyncRetryRef.current) clearTimeout(clockSyncRetryRef.current)
+      clockSyncRetryRef.current = null
+      return
+    }
+    clockOffsetRef.current = null
+    if (!retrying) {
+      clockSyncRetryRef.current = setTimeout(() => {
+        clockSyncRetryRef.current = null
+        if (channelRef.current === channel && clockHostRef.current === currentHostGid) void synchronizeClock(channel, participantGid, currentHostGid, true)
+      }, 2000)
+      return
+    }
+    if (channelRef.current === channel && clockHostRef.current === currentHostGid) options.setClockSyncWarning(true)
   }
 
-  const publish = useCallback(async (nextBoard = options.board, doneMs = options.me?.doneMs ?? null) => {
+  const updateSelfData = useCallback(async (update: Partial<Player>) => {
     const me = options.me
     if (!me) return
-    const next = { ...me, board: nextBoard, moves: options.movesRef.current, doneMs, bestPossibleMoves: options.optimalMovesRef.current, hostGid, difficulty: options.difficulty }
+    const next = { ...me, ...update }
+    options.setMe(next)
+    playersRef.current = playersRef.current.map(player => player.gid === next.gid ? next : player)
+    setPlayers(current => current.map(player => player.gid === next.gid ? next : player))
+    if (channelRef.current) {
+      try { await channelRef.current.track(next); await channelRef.current.send({ type: 'broadcast', event: 'move', payload: next }) }
+      catch { options.setMessage('Series score is saved on this device; reconnecting to sync it with the room.') }
+    }
+  }, [options.me, options.setMe, options.setMessage])
+
+  const resetSeriesState = (seriesLength: number) => {
+    if (!isSeriesLength(seriesLength)) return
+    options.setSeriesLength(seriesLength)
+    options.seriesScoredRef.current = false
+    options.movesRef.current = 0
+    options.moveLogRef.current = ''
+    options.hintsUsedRef.current = 0
+    options.roundSeedRef.current = null
+    options.initialBoardRef.current = SOLVED_BOARD
+    options.optimalMovesRef.current = 0
+    options.setHintsUsed(0)
+    options.setBoard(SOLVED_BOARD)
+    options.setRound('lobby')
+    options.setStartedAt(0)
+    options.setElapsed(0)
+    options.setPaused(false)
+    const current = playersRef.current.find(player => player.gid === gidRef.current)
+    if (!current) return
+    const next: Player = { ...current, board: SOLVED_BOARD, moves: 0, doneMs: null, hintsUsed: 0, points: 0, raceNumber: 1 }
+    delete next.moveLog
+    options.setMe(next)
+    playersRef.current = playersRef.current.map(player => player.gid === next.gid ? next : player)
+    setPlayers(all => all.map(player => player.gid === next.gid ? next : player))
+    if (channelRef.current) void channelRef.current.track(next)
+  }
+
+  const publish = useCallback(async (nextBoard = options.board, doneMs = options.me?.doneMs ?? null, finishMoveLog?: string) => {
+    const me = options.me
+    if (!me) return
+    const next: Player = { ...me, board: nextBoard, moves: options.movesRef.current, doneMs, bestPossibleMoves: options.optimalMovesRef.current, hostGid, difficulty: options.difficulty }
+    if (doneMs !== null && typeof finishMoveLog === 'string') next.moveLog = finishMoveLog
+    else delete next.moveLog
+    next.hintsUsed = options.hintsUsedRef.current
     options.setMe(next)
     playersRef.current = playersRef.current.map(player => player.gid === next.gid ? next : player)
     setPlayers(current => current.map(player => player.gid === next.gid ? next : player))
@@ -105,7 +184,7 @@ export function useRoom(options: Options) {
       try { await channelRef.current.track(next); await channelRef.current.send({ type: 'broadcast', event: 'move', payload: next }) }
       catch { options.setMessage('Move is saved on this device; reconnecting to sync it with the room.') }
     }
-  }, [options.board, options.me, options.difficulty, options.movesRef, options.optimalMovesRef, options.setMe, options.setMessage, hostGid])
+  }, [options.board, options.me, options.difficulty, options.movesRef, options.moveLogRef, options.hintsUsedRef, options.optimalMovesRef, options.setMe, options.setMessage, hostGid])
 
   const enterRoom = async (requestedCode: string, restoredName = options.name, resumeData?: unknown, createRoom = false) => {
     const cleanName = restoredName.trim().slice(0, 12)
@@ -116,6 +195,7 @@ export function useRoom(options: Options) {
     const normalized = requestedCode.toUpperCase()
     clockOffsetRef.current = null
     clockHostRef.current = ''
+    options.setClockSyncWarning(false)
     const saved = resumeData && typeof resumeData === 'object' ? resumeData as Record<string, any> : null
     if (!saved || saved.room !== normalized) { playersRef.current = []; leftPlayersRef.current = []; setPlayers([]) }
     const restoredPlayer = saved ? parsePlayer(saved.me) : null
@@ -154,6 +234,14 @@ export function useRoom(options: Options) {
       if (!player || player.gid === gid || !playersRef.current.some(active => active.gid === player.gid)) return
       playersRef.current = playersRef.current.map(current => current.gid === player.gid ? player : current)
       setPlayers(current => current.map(existing => existing.gid === player.gid ? player : existing))
+    }).on('broadcast', { event: 'reaction' }, ({ payload }: { payload: unknown }) => {
+      const reaction = parseReaction(payload)
+      if (!reaction || reaction.gid === gid || !playersRef.current.some(player => player.gid === reaction.gid && player.left !== true)) return
+      const now = Date.now()
+      const previous = reactionReceivedAtRef.current.get(reaction.gid) ?? null
+      if (!canSendReaction(previous, now)) return
+      reactionReceivedAtRef.current.set(reaction.gid, now)
+      options.onReaction(reaction.gid, reaction.emoji)
     }).on('broadcast', { event: 'clock-ping' }, ({ payload }: { payload: unknown }) => {
       if (!payload || typeof payload !== 'object') return
       const ping = payload as { fromGid?: unknown; pingId?: unknown; sentAt?: unknown }
@@ -169,14 +257,27 @@ export function useRoom(options: Options) {
       const start = parseRoundStart(payload)
       if (!start || start.gid !== playersRef.current[0]?.gid || start.gid === gid) return
       options.setDifficulty(start.difficulty)
-      const localStartAt = clockOffsetRef.current === null ? Date.now() + 3000 : start.startAt - clockOffsetRef.current
+      options.setHintsEnabled(start.hints)
+      options.setSeriesLength(start.seriesLength)
+      const now = Date.now()
+      const localStartAt = clockOffsetRef.current === null ? now + 3000 : start.startAt - clockOffsetRef.current
+      if (!isStartAtInRange(localStartAt, now)) { options.setMessage('Ignored an invalid start time from the host.'); return }
       options.beginRound(start.seed, start.difficulty, localStartAt)
     }).on('broadcast', { event: 'restart' }, ({ payload }: { payload: unknown }) => {
       const start = parseRoundStart(payload)
       if (!start || start.gid !== playersRef.current[0]?.gid || start.gid === gid) return
       options.setDifficulty(start.difficulty)
-      const localStartAt = clockOffsetRef.current === null ? Date.now() + 3000 : start.startAt - clockOffsetRef.current
+      options.setHintsEnabled(start.hints)
+      options.setSeriesLength(start.seriesLength)
+      const now = Date.now()
+      const localStartAt = clockOffsetRef.current === null ? now + 3000 : start.startAt - clockOffsetRef.current
+      if (!isStartAtInRange(localStartAt, now)) { options.setMessage('Ignored an invalid start time from the host.'); return }
       options.beginRound(start.seed, start.difficulty, localStartAt)
+    }).on('broadcast', { event: 'series-reset' }, ({ payload }: { payload: unknown }) => {
+      if (!payload || typeof payload !== 'object') return
+      const reset = payload as { gid?: unknown; seriesLength?: unknown }
+      if (reset.gid !== playersRef.current[0]?.gid || !isSeriesLength(reset.seriesLength)) return
+      resetSeriesState(reset.seriesLength)
     }).on('broadcast', { event: 'pause' }, ({ payload }: { payload: unknown }) => {
       const pause = parsePause(payload)
       if (!pause || pause.gid !== playersRef.current[0]?.gid || pause.gid === gid) return
@@ -201,9 +302,9 @@ export function useRoom(options: Options) {
     const occupied = [...new Set(playersRef.current.map(player => player.gid).filter(playerGid => playerGid !== gid))]
     if (occupied.length >= 4) { await channel.unsubscribe(); options.setMessage('Room is full. This race already has four players.'); return }
     if (!createRoom && !saved && occupied.length === 0) { await channel.unsubscribe(); options.setMessage('No active room found with that code. Check the code or ask the host for a fresh link.'); return }
-    const player: Player = restoredPlayer ? { ...restoredPlayer, name: cleanName, gid, joinedAt: joinedAtRef.current } : { name: cleanName, joinedAt: joinedAtRef.current, gid, board: SOLVED_BOARD, moves: 0, doneMs: null }
+    const player: Player = restoredPlayer ? { ...restoredPlayer, name: cleanName, gid, joinedAt: joinedAtRef.current } : { name: cleanName, joinedAt: joinedAtRef.current, gid, board: SOLVED_BOARD, moves: 0, doneMs: null, hintsUsed: 0, points: 0, raceNumber: playersRef.current[0]?.raceNumber ?? 1 }
     const roomHostGid = playersRef.current[0]?.gid ?? gid
-    const joinedPlayer = { ...player, hostGid: roomHostGid, difficulty: options.difficulty }
+    const joinedPlayer = { ...player, hostGid: roomHostGid, difficulty: options.difficulty, hintsUsed: player.hintsUsed ?? 0, points: player.points ?? 0, raceNumber: player.raceNumber ?? playersRef.current[0]?.raceNumber ?? 1 }
     channelRef.current = channel
     options.setRoom(normalized)
     options.setMode('multi')
@@ -221,6 +322,12 @@ export function useRoom(options: Options) {
       options.initialBoardRef.current = saved.startBoard ?? saved.board
       options.optimalMovesRef.current = getOptimalMoves(options.initialBoardRef.current) ?? 0
       options.movesRef.current = saved.moves ?? 0
+      options.moveLogRef.current = typeof saved.moveLog === 'string' ? saved.moveLog : ''
+      options.hintsUsedRef.current = Number.isSafeInteger(saved.hintsUsed) ? saved.hintsUsed : restoredPlayer?.hintsUsed ?? 0
+      options.setHintsUsed(options.hintsUsedRef.current)
+      options.setHintsEnabled(Boolean(saved.hintsEnabled))
+      options.setSeriesLength(isSeriesLength(saved.seriesLength) ? saved.seriesLength : 1)
+      options.seriesScoredRef.current = Boolean(saved.seriesScored)
       options.setRound(saved.round)
       options.setStartedAt(saved.startedAt)
       options.setElapsed(saved.elapsed ?? 0)
@@ -241,6 +348,11 @@ export function useRoom(options: Options) {
   const leaveRoom = () => {
     channelRef.current?.unsubscribe()
     channelRef.current = null
+    if (clockSyncRetryRef.current) clearTimeout(clockSyncRetryRef.current)
+    clockSyncRetryRef.current = null
+    options.setClockSyncWarning(false)
+    reactionReceivedAtRef.current.clear()
+    lastReactionSentAtRef.current = null
     if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
     reconnectTimerRef.current = null
     playersRef.current = []
@@ -249,10 +361,29 @@ export function useRoom(options: Options) {
     setHostGid('')
   }
 
-  const sendRound = async (event: 'start' | 'restart', seed: number, difficulty: Difficulty) => {
+  const sendRound = async (event: 'start' | 'restart', seed: number, difficulty: Difficulty, hints = options.hintsEnabled, seriesLength = options.seriesLength) => {
     const startAt = Date.now() + 3000
-    if (channelRef.current) await channelRef.current.send({ type: 'broadcast', event, payload: { gid: gidRef.current, seed, difficulty, startAt } })
+    if (channelRef.current) await channelRef.current.send({ type: 'broadcast', event, payload: { gid: gidRef.current, seed, difficulty, startAt, hints, seriesLength } })
     return startAt
+  }
+
+  const startNewSeries = async (seriesLength: number) => {
+    if (!host || !isSeriesLength(seriesLength)) return
+    if (channelRef.current) await channelRef.current.send({ type: 'broadcast', event: 'series-reset', payload: { gid: gidRef.current, seriesLength } })
+    resetSeriesState(seriesLength)
+  }
+
+  const sendReaction = async (emoji: ReactionEmoji) => {
+    const now = Date.now()
+    if (!channelRef.current || !isReactionEmoji(emoji) || !canSendReaction(lastReactionSentAtRef.current, now)) return false
+    lastReactionSentAtRef.current = now
+    try {
+      await channelRef.current.send({ type: 'broadcast', event: 'reaction', payload: { gid: gidRef.current, emoji } })
+      return true
+    } catch {
+      options.setMessage('Could not send that reaction. Check your connection and try again.')
+      return false
+    }
   }
 
   const sendPause = async (paused: boolean, elapsed: number) => {
@@ -261,10 +392,11 @@ export function useRoom(options: Options) {
 
   useEffect(() => () => {
     channelRef.current?.unsubscribe()
+    if (clockSyncRetryRef.current) clearTimeout(clockSyncRetryRef.current)
     if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current)
     for (const resolve of clockPongWaitersRef.current.values()) resolve(Date.now())
     clockPongWaitersRef.current.clear()
   }, [])
 
-  return { players, playersRef, leftPlayersRef, hostGid, host, gidRef, joinedAtRef, channelRef, enterRoom, publish, createLocalPlayer, leaveRoom, sendRound, sendPause }
+  return { players, playersRef, leftPlayersRef, hostGid, host, gidRef, joinedAtRef, channelRef, enterRoom, publish, updateSelfData, createLocalPlayer, leaveRoom, sendRound, sendPause, sendReaction, startNewSeries }
 }
